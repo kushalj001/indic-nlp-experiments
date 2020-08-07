@@ -17,6 +17,16 @@ python run_pos.py \
 --base_model_type distilbert \
 --language multilingual
 ```
+## TODO
+- [ ] Update README with latest commands. The scripts after today's changes won't work.
+- [x] Test on linux by installing the requirements in a virtual env. The above scripts are tested on Windows with python 3.6.3
+- [ ] Run experiments for Bengali DistilBERT (Kushal).
+- [ ] Run finetuning experiments for all the models on GPU.
+- [x] Include hyperparameter search using Weights and Biases.
+- [ ] Run sweeps and update results.
+- [ ] Use huggingface's squad script for Hindi.
+
+
 
 ### POS-Tagging Hindi DistilBERT (Panini)  
 ```
@@ -52,9 +62,3 @@ python run_classification.py \
 ```
 
 
-## TODO
-- [ ] Test on linux by installing the requirements in a virtual env. The above scripts are tested on Windows with python 3.6.3
-- [ ] Run experiments for Bengali DistilBERT (Kushal).
-- [ ] Run finetuning experiments for all the models on GPU.
-- [ ] Include hyperparameter search using Weights and Biases.
-- [ ] Use huggingface's squad script for Hindi.
