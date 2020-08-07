@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import time, gc, os, typing
 import transformers
-from transformers import AutoConfig, AutoModel, AutoTokenizer, AdamW
+from transformers import AutoConfig, AutoModel, AutoTokenizer, AdamW, get_linear_schedule_with_warmup
 from torchtext import datasets
 from collections import Counter
 from sklearn.model_selection import train_test_split
@@ -16,17 +16,23 @@ import conllu
 from conllu import parse_incr
 from seqeval.metrics import accuracy_score, f1_score, precision_score, recall_score, classification_report
 import argparse
-
+import wandb
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--train_data_path', type=str, required=True, metavar='', help='Path to training file')
 parser.add_argument('--valid_data_path', type=str, required=True, metavar='', help='Path to validation file')
 parser.add_argument('--base_model_type', type=str, metavar='', required=True, help='Type of transformer model. Currently supports BERT and DistilBERT.')
 parser.add_argument('--language', type=str, required=True, help="Multingual DistilBERT or Hindi distilBERT")
-parser.add_argument('--freeze', type=bool, metavar='', help='Freeze the base model if True, finetune if False', default=True)
+parser.add_argument('--head_type', type=str, help="Head to train on top of frozen model. Current choices: linear, multilinear, lstm, bilstm, transformer.", default='linear')
+parser.add_argument('--freeze', type=eval, metavar='', help='Freeze the base model if True, finetune if False', default='True')
 parser.add_argument('--batch_size', type=int, metavar='', default=32)
 parser.add_argument('--epochs', type=int, metavar='', help='Epochs to train', default=5)
 parser.add_argument('--lr', type=float, metavar='', help='Learning rate', default=0.001)
+parser.add_argument('--lstm_layers', type=int, help='Number of LSTM layers in head if head type is lstm or bilstm.', default=1)
+parser.add_argument('--adam_epsilon', type=float, metavar='', help='Adam epsilon', default=1e-6)
+parser.add_argument('--weight_decay', type=float, metavar='', help='Adam weight decay', default=0.01)
+parser.add_argument('--warmup_proportion', type=float, metavar='', help='Proportion of training to perform linear learning rate warmup', default=0.1)
+
 args = parser.parse_args()
 
 def parse_ud_data(path:str)->tuple:
@@ -249,7 +255,7 @@ class POSDataset:
             
 class POS(nn.Module):
     
-    def __init__(self, num_labels, base_model, base_model_type, freeze, device):
+    def __init__(self, num_labels, base_model, base_model_type, head_type, freeze, model_dim, num_lstm_layers, classifier_dim, device):
         
         super().__init__()
         self.freeze = freeze
@@ -257,8 +263,40 @@ class POS(nn.Module):
         self.num_labels = num_labels
         self.base_model = base_model
         self.base_model_type = base_model_type
-        self.fc1 = nn.Linear(768, 100)
-        self.fc2 = nn.Linear(100, num_labels)
+        self.head_type = head_type
+
+        self.linear_head = nn.Linear(in_features=model_dim, out_features=classifier_dim)
+        
+        self.multilinear_head = nn.Sequential(nn.Linear(in_features=model_dim, out_features=256),
+                                              nn.Dropout(0.2),
+                                              nn.Linear(in_features=256, out_features=classifier_dim),
+                                              nn.Dropout(0.2)
+                                             )
+        
+        
+        self.lstm_head = nn.Sequential(nn.LSTM(input_size=model_dim, hidden_size=model_dim, 
+                                               num_layers=num_lstm_layers, batch_first=True),
+                                       nn.Dropout(0.2),
+                                       nn.Linear(in_features=model_dim, out_features=classifier_dim),
+                                       nn.Dropout(0.2)
+                                      )
+        
+        self.bilstm_head = nn.Sequential(nn.LSTM(input_size=model_dim, hidden_size=model_dim, num_layers=num_lstm_layers,
+                                                 bidirectional=True, batch_first=True, dropout=0.2),
+                                         nn.Dropout(0.2),
+                                         nn.Linear(in_features=model_dim*2, out_features=classifer_dim),
+                                         nn.Dropout(0.2)
+                                        )
+        
+        
+        self.transformer_head = nn.Sequential(nn.TransformerEncoderLayer(d_model=model_dim, nhead=8, 
+                                                                         dim_feedforward=3072),
+                                              nn.Linear(in_features=model_dim, out_features=classifier_dim),
+                                              nn.Dropout(0.2)
+                                             )
+        
+        self.classifier = nn.Linear(in_features=classifier_dim, out_features=num_labels)
+        
         
     def forward(self, input_ids, input_mask, valid_ids, segment_ids):
         
@@ -298,11 +336,37 @@ class POS(nn.Module):
                     valid_output[i][m] = sequence_output[i][j]
         
         sequence_output = F.dropout(valid_output, p=0.3)
-        logits = self.fc2(self.fc1(sequence_output))
-        # [bs, seq_len, num_labels]
+
+        if self.freeze == True:
+
+            if self.head_type == 'linear':
+                head_out = self.linear_head(sequence_output)
+            
+            elif self.head_type == 'multilinear':
+                head_out = self.multilinear_head(sequence_output)
+
+            elif self.head_type == 'lstm':
+                head_out = self.lstm_head(sequence_output)
+                
+            elif self.head_type == 'bilstm':
+                head_out = self.bilstm_head(sequence_output)
+            
+            elif self.head_type == 'transformer':
+                head_out = self.transformer_head(sequence_output)
+            
+            out = self.classifier(head_out)
+            # [bs, seq_len, num_labels]
+
+            logits = out.view(-1, self.num_labels)
+            # [N, num_labels]
         
-        logits = logits.view(-1, self.num_labels)
-        # [N, num_labels]
+        else:
+
+            logits = self.classifier(self.linear_head(sequence_output))
+            # [bs, seq_len, num_labels]
+            
+            logits = logits.view(-1, self.num_labels)
+            # [N, num_labels]
         
         return logits      
     
@@ -363,7 +427,7 @@ def seqeval_metrics(preds, y, idx2tag, tag_pad_idx=0):
     
      
     
-def train(model, optimizer, train_dataset):
+def train(model, optimizer, scheduler, train_dataset):
     
     print("Starting Training")
     train_loss = 0.
@@ -389,7 +453,13 @@ def train(model, optimizer, train_dataset):
         train_loss += loss.item()
         loss.backward()
         optimizer.step()
+        scheduler.step()
         optimizer.zero_grad()
+
+    wandb.log({
+        "Train Accuracy": train_acc/len(train_dataset),
+        "Train Loss": train_loss/len(train_dataset)
+    })
         
     return train_loss/len(train_dataset), train_acc/len(train_dataset)
 
@@ -428,6 +498,12 @@ def validate(model, valid_dataset, idx2tag):
     valid_acc = valid_acc/len(valid_dataset)
     valid_f1 = valid_f1/len(valid_dataset)
     
+    wandb.log({
+        "Valid Accuracy": valid_acc,
+        "Valid Loss": valid_loss,
+        "Valid F1": valid_f1
+    })   
+
     return valid_loss, valid_acc, valid_f1
 
 
@@ -457,6 +533,21 @@ if __name__ == '__main__':
     base_model_type = args.base_model_type
     print("Model type: ", base_model_type)
     print("Language : ", args.language)
+
+    wandb.init(entity='kushalj', project='indic-nlp')
+    config = wandb.config
+    config.batch_size = args.batch_size
+    config.lr = args.lr
+    config.epochs = args.epochs
+    config.weight_decay = args.weight_decay
+    config.adam_epsilon = args.adam_epsilon
+    config.warmup_proportion = args.warmup_proportion
+    config.num_lstm_layers = args.num_lstm_layers
+    config.head_type = args.head_type
+    
+    torch.manual_seed(42)
+
+
     if base_model_type == 'distilbert':
         if args.language == 'hi':
             tokenizer = AutoTokenizer.from_pretrained('hi-lm-distilbert/')
@@ -471,15 +562,49 @@ if __name__ == '__main__':
     train_dataset = POSDataset(tokenizer, ud_train_df, args.batch_size, ud_tag2idx)
     valid_dataset = POSDataset(tokenizer, ud_dev_df, args.batch_size, ud_tag2idx)
 
+   
+    model_dim = base_model.get_input_embeddings().embedding_dim
+    
+    model = POS(num_labels=len(ud_tag2idx), 
+                base_model=base_model, 
+                base_model_type=args.base_model_type, 
+                head_type=args.head_type,
+                freeze=args.freeze, 
+                model_dim=model_dim,
+                num_lstm_layers=args.num_lstm_layers,
+                classifier_dim=128,
+                device=device).to(device)
+
+
     if args.freeze == True:
         print("Freezing the base model")
         for param in base_model.parameters():
             param.requires_grad = False
+        
+        num_train_optimization_steps = len(train_dataset) * config.epochs
+        warmup_steps = int(config.warmup_proportion * num_train_optimization_steps)
+        optimizer = AdamW(model.parameters(), lr=config.lr, eps=config.adam_epsilon, weight_decay=args.weight_decay)
+        scheduler = get_linear_schedule_with_warmup(optimizer,
+                                                    num_warmup_steps=warmup_steps,
+                                                    num_training_steps=num_train_optimization_steps)
+
     else:
         print("Finetuning")
+        param_optimizer = list(model.named_parameters())
+        no_decay = ['bias','LayerNorm.weight']
+        optimizer_grouped_parameters = [
+            {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay},
+            {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+        ]
+        num_train_optimization_steps = len(train_dataset) * config.epochs
+        warmup_steps = int(config.warmup_proportion * num_train_optimization_steps)
+        optimizer = AdamW(optimizer_grouped_parameters, lr=config.lr, eps=config.adam_epsilon)
+        scheduler = get_linear_schedule_with_warmup(optimizer,
+                                                    num_warmup_steps=warmup_steps,
+                                                    num_training_steps=num_train_optimization_steps)
 
-    model = POS(len(ud_tag2idx), base_model, args.base_model_type, args.freeze, device).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    wandb.watch(model, log='all')
 
     epochs = args.epochs
     for epoch in range(epochs):
@@ -487,7 +612,7 @@ if __name__ == '__main__':
         
         start_time = time.time()
         
-        train_loss, train_acc = train(model, optimizer, train_dataset)
+        train_loss, train_acc = train(model, optimizer, scheduler, train_dataset)
         valid_loss, valid_acc, valid_f1 = validate(model, valid_dataset, ud_idx2tag)
         
         end_time = time.time()
