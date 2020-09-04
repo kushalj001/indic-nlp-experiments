@@ -9,30 +9,34 @@ import pandas as pd
 import time, gc, os, typing
 import transformers
 from transformers import AutoConfig, AutoModel, AutoTokenizer, AdamW, get_linear_schedule_with_warmup
-from torchtext import datasets
 from collections import Counter
 from sklearn.model_selection import train_test_split
 import conllu
 from conllu import parse_incr
 from seqeval.metrics import accuracy_score, f1_score, precision_score, recall_score, classification_report
 import argparse
-import wandb
+import wandb, string
+nltk.download('indian')
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--train_data_path', type=str, required=True, metavar='', help='Path to training file')
 parser.add_argument('--valid_data_path', type=str, required=True, metavar='', help='Path to validation file')
+parser.add_argument('--test_data_path', type=str, help='Path to test data file', default='None')
 parser.add_argument('--base_model_type', type=str, metavar='', required=True, help='Type of transformer model. Currently supports BERT and DistilBERT.')
 parser.add_argument('--language', type=str, required=True, help="Multingual DistilBERT or Hindi distilBERT")
+parser.add_argument('--cuda_device', type=int, required=True, help='On which GPU to train in a multi-GPU setup.')
 parser.add_argument('--head_type', type=str, help="Head to train on top of frozen model. Current choices: linear, multilinear, lstm, bilstm, transformer.", default='linear')
+parser.add_argument('--dropout', type=float, metavar='', help= 'Dropout between layers.', default=0.2)
 parser.add_argument('--freeze', type=eval, metavar='', help='Freeze the base model if True, finetune if False', default='True')
 parser.add_argument('--batch_size', type=int, metavar='', default=32)
-parser.add_argument('--epochs', type=int, metavar='', help='Epochs to train', default=5)
+parser.add_argument('--epochs', type=int, metavar='', help='Epochs to train', default=16)
 parser.add_argument('--lr', type=float, metavar='', help='Learning rate', default=0.001)
-parser.add_argument('--lstm_layers', type=int, help='Number of LSTM layers in head if head type is lstm or bilstm.', default=1)
+parser.add_argument('--num_lstm_layers', type=int, help='Number of LSTM layers in head if head type is lstm or bilstm.', default=2)
 parser.add_argument('--adam_epsilon', type=float, metavar='', help='Adam epsilon', default=1e-6)
 parser.add_argument('--weight_decay', type=float, metavar='', help='Adam weight decay', default=0.01)
 parser.add_argument('--warmup_proportion', type=float, metavar='', help='Proportion of training to perform linear learning rate warmup', default=0.1)
-
+parser.add_argument('--max_seq_length', type=int, default=300)
+parser.add_argument('--multilingual', type=eval, default='False')
 args = parser.parse_args()
 
 def parse_ud_data(path:str)->tuple:
@@ -66,6 +70,47 @@ def parse_ud_data(path:str)->tuple:
     
     return all_words, all_tags, tags_list
 
+
+def parse_nltk_data(language):
+    '''
+    Parses NLTK data from the indian corpus.
+    '''
+    tagged_sents = indian.tagged_sents(language+'.pos')
+    all_sents = []
+    all_words = []
+    all_tags = []
+    tags_list = []
+    err = []
+    tagged_sents = list(tagged_sents)
+    for i, tagged_sent in enumerate(tagged_sents):
+        sent = ''
+        tags = []
+        words = []
+        for pairs in tagged_sent:
+            if pairs[1] != '':
+                clean_tag = ''.join([ch for ch in pairs[1] if ch not in string.punctuation])
+                tags.append(clean_tag)
+                tags_list.append(clean_tag)
+                
+            if pairs[0] != '':
+                words.append(pairs[0])
+                
+            sent += pairs[0] + ' '
+            
+        try:
+            assert len(words) == len(tags)
+        except:
+            err.append(i)    
+        
+        if i not in err:
+            all_sents.append(sent)
+            all_tags.append(tags)
+            all_words.append(words)
+        
+    return all_words, all_tags, tags_list
+
+    
+
 def create_tag2idx(tags):
     '''
     Creates a vocabulary for labels/tags.
@@ -74,10 +119,10 @@ def create_tag2idx(tags):
     tag_vocab = sorted(tag_counter, key=tag_counter.get, reverse=True)
     #print(f"raw-vocab: {len(tag_vocab)}")
     
-    tag_vocab.insert(0, '[PAD]')
-    tag_vocab.insert(1, '[UNK]')
-    tag_vocab.append("[CLS]")
-    tag_vocab.append("[SEP]")
+    tag_vocab.insert(0, tokenizer.pad_token)
+    tag_vocab.insert(1, tokenizer.unk_token)
+    tag_vocab.append(tokenizer.cls_token)
+    tag_vocab.append(tokenizer.sep_token)
     
     #print(f"vocab-length: {len(tag_vocab)}")
     tag2idx = {tag:idx for idx, tag in enumerate(tag_vocab)}
@@ -106,7 +151,7 @@ class POSDataset:
    
     def __iter__(self):
         
-        max_seq_length = 300
+        max_seq_length = args.max_seq_length
         
         # iterate through batches within the data
         for i, batch in enumerate(self.data):
@@ -169,7 +214,7 @@ class POSDataset:
                 label_ids = []
                 
             
-                input_tokens.append("[CLS]")
+                input_tokens.append(self.tokenizer.cls_token)
                 segment_ids.append(0)
                 valid_positions.insert(0,1)
                 
@@ -177,7 +222,7 @@ class POSDataset:
                 # Not used in our case. For loss calculation we use ingore_index parameter, which 
                 # works fine.
                 label_mask.insert(0,1)
-                label_ids.append(self.tag2idx["[CLS]"])
+                label_ids.append(self.tag2idx[self.tokenizer.cls_token])
                 
                 
                 # Transfer the tokens collected above into input_tokens after adding special tokens.
@@ -196,11 +241,11 @@ class POSDataset:
                     if len(labels) > i:
                         label_ids.append(self.tag2idx[labels[i]])
                     
-                input_tokens.append("[SEP]")
+                input_tokens.append(self.tokenizer.sep_token)
                 segment_ids.append(0)
                 valid_positions.append(1)
                 label_mask.append(1)
-                label_ids.append(self.tag2idx["[SEP]"])
+                label_ids.append(self.tag2idx[self.tokenizer.sep_token])
                 
                 # Convert the input_tokens into respective ids.
                 input_ids = self.tokenizer.convert_tokens_to_ids(input_tokens)
@@ -255,7 +300,7 @@ class POSDataset:
             
 class POS(nn.Module):
     
-    def __init__(self, num_labels, base_model, base_model_type, head_type, freeze, model_dim, num_lstm_layers, classifier_dim, device):
+    def __init__(self, num_labels, base_model, base_model_type, head_type, freeze, model_dim, num_lstm_layers, classifier_dim, dropout, device):
         
         super().__init__()
         self.freeze = freeze
@@ -264,35 +309,37 @@ class POS(nn.Module):
         self.base_model = base_model
         self.base_model_type = base_model_type
         self.head_type = head_type
+        self.dropout = dropout
+
+        self.lstm = nn.LSTM(input_size=model_dim, hidden_size=model_dim, 
+                            num_layers=num_lstm_layers, batch_first=True, dropout=dropout)
+
+        self.bilstm = nn.LSTM(input_size=model_dim, hidden_size=model_dim, num_layers=num_lstm_layers,
+                              bidirectional=True, batch_first=True, dropout=dropout)
 
         self.linear_head = nn.Linear(in_features=model_dim, out_features=classifier_dim)
         
         self.multilinear_head = nn.Sequential(nn.Linear(in_features=model_dim, out_features=256),
-                                              nn.Dropout(0.2),
+                                              nn.Dropout(dropout),
                                               nn.Linear(in_features=256, out_features=classifier_dim),
-                                              nn.Dropout(0.2)
+                                              nn.Dropout(dropout)
                                              )
         
-        
-        self.lstm_head = nn.Sequential(nn.LSTM(input_size=model_dim, hidden_size=model_dim, 
-                                               num_layers=num_lstm_layers, batch_first=True),
-                                       nn.Dropout(0.2),
+        self.lstm_head = nn.Sequential(
                                        nn.Linear(in_features=model_dim, out_features=classifier_dim),
-                                       nn.Dropout(0.2)
+                                       nn.Dropout(dropout)
                                       )
         
-        self.bilstm_head = nn.Sequential(nn.LSTM(input_size=model_dim, hidden_size=model_dim, num_layers=num_lstm_layers,
-                                                 bidirectional=True, batch_first=True, dropout=0.2),
-                                         nn.Dropout(0.2),
-                                         nn.Linear(in_features=model_dim*2, out_features=classifer_dim),
-                                         nn.Dropout(0.2)
+        self.bilstm_head = nn.Sequential(
+                                         nn.Linear(in_features=model_dim*2, out_features=classifier_dim),
+                                         nn.Dropout(dropout)
                                         )
         
         
         self.transformer_head = nn.Sequential(nn.TransformerEncoderLayer(d_model=model_dim, nhead=8, 
                                                                          dim_feedforward=3072),
                                               nn.Linear(in_features=model_dim, out_features=classifier_dim),
-                                              nn.Dropout(0.2)
+                                              nn.Dropout(dropout)
                                              )
         
         self.classifier = nn.Linear(in_features=classifier_dim, out_features=num_labels)
@@ -305,22 +352,24 @@ class POS(nn.Module):
         if self.freeze == True:
             with torch.no_grad():
                 
-                if self.base_model_type == 'bert':
+                if self.base_model_type == 'distilbert':
+                    sequence_output = self.base_model(input_ids=input_ids, attention_mask=input_mask)[0]
+                  
+                else:
                     sequence_output, pooled_output = self.base_model(input_ids=input_ids, 
                                                                      attention_mask=input_mask, 
                                                                      token_type_ids=segment_ids)
-                
-                elif self.base_model_type == 'distilbert':
-                    sequence_output = self.base_model(input_ids=input_ids, attention_mask=input_mask)[0]
+                   
         
         else:
-            if self.base_model_type == 'bert':
+            if self.base_model_type == 'distilbert':
+                    sequence_output = self.base_model(input_ids=input_ids, attention_mask=input_mask)[0]
+
+            else:
                 sequence_output, pooled_output = self.base_model(input_ids=input_ids, 
                                                                  attention_mask=input_mask, 
                                                                  token_type_ids=segment_ids)
-            
-            elif self.base_model_type == 'distilbert':
-                    sequence_output = self.base_model(input_ids=input_ids, attention_mask=input_mask)[0]
+        
         
             
             
@@ -335,7 +384,7 @@ class POS(nn.Module):
                     m += 1
                     valid_output[i][m] = sequence_output[i][j]
         
-        sequence_output = F.dropout(valid_output, p=0.3)
+        sequence_output = F.dropout(valid_output, p=self.dropout)
 
         if self.freeze == True:
 
@@ -346,10 +395,12 @@ class POS(nn.Module):
                 head_out = self.multilinear_head(sequence_output)
 
             elif self.head_type == 'lstm':
-                head_out = self.lstm_head(sequence_output)
+                lstm_out, _ = self.lstm(sequence_output)
+                head_out = self.lstm_head(lstm_out)
                 
             elif self.head_type == 'bilstm':
-                head_out = self.bilstm_head(sequence_output)
+                bilstm_out, _ = self.bilstm(sequence_output)
+                head_out = self.bilstm_head(bilstm_out)
             
             elif self.head_type == 'transformer':
                 head_out = self.transformer_head(sequence_output)
@@ -362,7 +413,7 @@ class POS(nn.Module):
         
         else:
 
-            logits = self.classifier(self.linear_head(sequence_output))
+            logits = self.classifier(F.dropout(self.linear_head(sequence_output), p=self.dropout))
             # [bs, seq_len, num_labels]
             
             logits = logits.view(-1, self.num_labels)
@@ -521,51 +572,69 @@ def epoch_time(start_time, end_time):
 
 if __name__ == '__main__':
 
-    train_words, train_tags, ud_train_tags = parse_ud_data(args.train_data_path)
-    dev_words, dev_tags, ud_dev_tags = parse_ud_data(args.valid_data_path)
-
-    ud_train_df = pd.DataFrame({'words':train_words, 'tags':train_tags}) 
-    ud_dev_df = pd.DataFrame({'words':dev_words, 'tags':dev_tags})
-
-    ud_tag2idx, ud_idx2tag = create_tag2idx(ud_train_tags)
-
-    device = torch.device('cuda')
+    device = torch.device('cuda:'+str(args.cuda_device))
     base_model_type = args.base_model_type
     print("Model type: ", base_model_type)
     print("Language : ", args.language)
-
-    wandb.init(entity='kushalj', project='indic-nlp')
+    run = wandb.init(entity='kushalj', project='indic-nlp')
+    run.save()
+    print(wandb.run.dir)
     config = wandb.config
     config.batch_size = args.batch_size
     config.lr = args.lr
     config.epochs = args.epochs
     config.weight_decay = args.weight_decay
     config.adam_epsilon = args.adam_epsilon
-    config.warmup_proportion = args.warmup_proportion
     config.num_lstm_layers = args.num_lstm_layers
     config.head_type = args.head_type
-    
+    config.dropout = args.dropout
+
     torch.manual_seed(42)
 
+    if args.multilingual == True:
+        base_model_name = args.base_model_type + '-base-multilingual-cased'
+    else:
+        base_model_name = args.language + '-lm-' + args.base_model_type
 
-    if base_model_type == 'distilbert':
-        if args.language == 'hi':
-            tokenizer = AutoTokenizer.from_pretrained('hi-lm-distilbert/')
-            base_model = AutoModel.from_pretrained('hi-lm-distilbert/').to(device)
-        else:
-            tokenizer = AutoTokenizer.from_pretrained('distilbert-base-multilingual-cased')
-            base_model = AutoModel.from_pretrained('distilbert-base-multilingual-cased').to(device) 
-    elif base_model_type == 'bert':
-        tokenizer = AutoTokenizer.from_pretrained('bert-base-multilingual-cased')
-        base_model = AutoModel.from_pretrained('bert-base-multilingual-cased')
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+    base_model = AutoModel.from_pretrained(base_model_name).to(device)
+    print(f"Loaded model and tokenizer successfully: {base_model_name}")
+
+    if args.language == 'hi' or args.language == 'te':
+        train_words, train_tags, train_tags_list = parse_ud_data(args.train_data_path)
+        dev_words, dev_tags, dev_tags_list = parse_ud_data(args.valid_data_path)
+        train_df = pd.DataFrame({'words':train_words, 'tags':train_tags}) 
+        dev_df = pd.DataFrame({'words':dev_words, 'tags':dev_tags})
+        tag2idx, idx2tag = create_tag2idx(train_tags_list)
+
+    elif args.language == 'bn':
+        words, tags, tags_list = parse_nltk_data('bangla')
+        df = pd.DataFrame({'words':words, 'tags':tags})
+        train_df, dev_df = train_test_split(df)
+        tag2idx, idx2tag = create_tag2idx(tags_list)
+
+    # if base_model_type == 'distilbert':
+    #     if args.language == 'hi':
+    #         tokenizer = AutoTokenizer.from_pretrained('hi-lm-distilbert/')
+    #         base_model = AutoModel.from_pretrained('hi-lm-distilbert/').to(device)
+    #     elif args.language == 'bn':
+    #         tokenizer =  AutoTokenizer.from_pretrained('bn-lm-distilbert/')
+    #         base_model = AutoModel.from_pretrained('bn-lm-distilbert/').to(device)
+    #     else:
+    #         tokenizer = AutoTokenizer.from_pretrained('distilbert-base-multilingual-cased')
+    #         base_model = AutoModel.from_pretrained('distilbert-base-multilingual-cased').to(device) 
+    # elif base_model_type == 'bert':
+    #     tokenizer = AutoTokenizer.from_pretrained('bert-base-multilingual-cased')
+    #     base_model = AutoModel.from_pretrained('bert-base-multilingual-cased')
     
-    train_dataset = POSDataset(tokenizer, ud_train_df, args.batch_size, ud_tag2idx)
-    valid_dataset = POSDataset(tokenizer, ud_dev_df, args.batch_size, ud_tag2idx)
+
+    train_dataset = POSDataset(tokenizer, train_df, args.batch_size, tag2idx)
+    valid_dataset = POSDataset(tokenizer, dev_df, args.batch_size, tag2idx)
 
    
     model_dim = base_model.get_input_embeddings().embedding_dim
     
-    model = POS(num_labels=len(ud_tag2idx), 
+    model = POS(num_labels=len(tag2idx), 
                 base_model=base_model, 
                 base_model_type=args.base_model_type, 
                 head_type=args.head_type,
@@ -573,6 +642,7 @@ if __name__ == '__main__':
                 model_dim=model_dim,
                 num_lstm_layers=args.num_lstm_layers,
                 classifier_dim=128,
+                dropout = args.dropout,
                 device=device).to(device)
 
 
@@ -581,9 +651,9 @@ if __name__ == '__main__':
         for param in base_model.parameters():
             param.requires_grad = False
         
-        num_train_optimization_steps = len(train_dataset) * config.epochs
-        warmup_steps = int(config.warmup_proportion * num_train_optimization_steps)
-        optimizer = AdamW(model.parameters(), lr=config.lr, eps=config.adam_epsilon, weight_decay=args.weight_decay)
+        num_train_optimization_steps = len(train_dataset) * args.epochs
+        warmup_steps = int(args.warmup_proportion * num_train_optimization_steps)
+        optimizer = AdamW(model.parameters(), lr=args.lr, eps=args.adam_epsilon, weight_decay=args.weight_decay)
         scheduler = get_linear_schedule_with_warmup(optimizer,
                                                     num_warmup_steps=warmup_steps,
                                                     num_training_steps=num_train_optimization_steps)
@@ -596,9 +666,9 @@ if __name__ == '__main__':
             {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay},
             {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
         ]
-        num_train_optimization_steps = len(train_dataset) * config.epochs
-        warmup_steps = int(config.warmup_proportion * num_train_optimization_steps)
-        optimizer = AdamW(optimizer_grouped_parameters, lr=config.lr, eps=config.adam_epsilon)
+        num_train_optimization_steps = len(train_dataset) * args.epochs
+        warmup_steps = int(args.warmup_proportion * num_train_optimization_steps)
+        optimizer = AdamW(optimizer_grouped_parameters, lr=args.lr, eps=args.adam_epsilon)
         scheduler = get_linear_schedule_with_warmup(optimizer,
                                                     num_warmup_steps=warmup_steps,
                                                     num_training_steps=num_train_optimization_steps)
@@ -607,15 +677,29 @@ if __name__ == '__main__':
     wandb.watch(model, log='all')
 
     epochs = args.epochs
+    patience = 0
+    best_valid_loss = 1000
+    best_valid_f1 = -1
     for epoch in range(epochs):
         print(f"Epoch {epoch+1}")
         
         start_time = time.time()
         
         train_loss, train_acc = train(model, optimizer, scheduler, train_dataset)
-        valid_loss, valid_acc, valid_f1 = validate(model, valid_dataset, ud_idx2tag)
+        valid_loss, valid_acc, valid_f1 = validate(model, valid_dataset, idx2tag)
         
         end_time = time.time()
+        
+        if valid_f1 > best_valid_f1:
+            best_valid_f1 = valid_f1
+        if valid_loss < best_valid_loss - 0.001:
+            best_valid_loss = valid_loss
+            patience = 0
+        elif patience == 3:
+            print("Early Stopping...")
+            break
+        else:
+            patience += 1
         
         epoch_mins, epoch_secs = epoch_time(start_time, end_time)
         
@@ -625,3 +709,24 @@ if __name__ == '__main__':
         print(f"Epoch valid accuracy: {valid_acc}")
         print(f"Epoch F1 score: {valid_f1}")
         print("====================================================================================")
+
+
+    summary = {'Valid F1': best_valid_f1, 'Valid Loss': best_valid_loss}
+    wandb.log(summary)
+    torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'valid_loss': valid_loss,
+                'valid_accuracy': valid_acc
+            }, os.path.join(wandb.run.dir, 'acc-{}-epoch-{}.pth'.format(round(valid_acc,3), epoch)))
+            
+    if args.test_data_path != 'None':
+        print("Running evaluation on test data...")
+        test_words, test_tags, _ = parse_ud_data(args.test_data_path)
+        test_df = pd.DataFrame({'words':test_words, 'tags':test_tags})
+        test_dataset = POSDataset(tokenizer, test_df, args.batch_size, tag2idx)
+        test_loss, test_acc, test_f1 = validate(model, test_dataset, idx2tag)
+        wandb.log({"Test Accuracy": test_acc, "Test Loss": test_loss, "Test F1": test_f1})
+
